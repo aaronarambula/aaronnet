@@ -41,13 +41,38 @@ class Tensor:
 
         def _backward():
             if self.requires_grad:
+                grad = out.grad
+                # broadcasting - sum over dimensions that were broadcasted
+                if self.data.shape != grad.shape:
+                    # sum over broadcasted dimensions
+                    ndims_added = grad.ndim - self.data.ndim
+                    for i in range(ndims_added):
+                        grad = grad.sum(axis=0)
+                    # sum over dimensions where self.data has size 1
+                    for i, (dim_orig, dim_grad) in enumerate(
+                        zip(self.data.shape, grad.shape)
+                    ):
+                        if dim_orig == 1 and dim_grad > 1:
+                            grad = grad.sum(axis=i, keepdims=True)
                 self.grad = (
                     self.grad if self.grad is not None else np.zeros_like(self.data)
-                ) + out.grad
+                ) + grad
             if other.requires_grad:
+                grad = out.grad
+                # handle broadcasting for other
+                if other.data.shape != grad.shape:
+                    ndims_added = grad.ndim - other.data.ndim
+                    for i in range(ndims_added):
+                        grad = grad.sum(axis=0)
+                    for i, (dim_orig, dim_grad) in enumerate(
+                        zip(other.data.shape, grad.shape)
+                    ):
+                        if dim_orig == 1 and dim_grad > 1:
+                            grad = grad.sum(axis=i, keepdims=True)
+
                 other.grad = (
                     other.grad if other.grad is not None else np.zeros_like(other.data)
-                ) + out.grad
+                ) + grad
 
         out._backward = _backward
         return out
@@ -89,7 +114,7 @@ class Tensor:
 
     def softmax(self):
         exps = np.exp(self.data - np.max(self.data, axis=-1, keepdims=True))
-        probs = exps / np.sum(exps, axis=1, keepdims=True)
+        probs = exps / np.sum(exps, axis=-1, keepdims=True)
         out = Tensor(probs, requires_grad=self.requires_grad)
         out._prev = {self}
 
@@ -98,10 +123,8 @@ class Tensor:
                 self.grad = (
                     self.grad if self.grad is not None else np.zeros_like(self.data)
                 )
-                for i, (p, g) in enumerate(zip(out.data, out.grad)):
-                    p = p.reshape(-1, 1)
-                    jacobian = np.diagflat(p) - np.dot(p, p.T)
-                    self.grad[i] += np.dot(jacobian, g)
+                s = (out.grad * out.data).sum(axis=-1, keepdims=True)
+                self.grad += out.data * (out.grad - s)
 
         out._backward = _backward
         return out
@@ -112,10 +135,10 @@ class Tensor:
 
         # compute softmax
         exps = np.exp(logits.data - np.max(logits.data, axis=-1, keepdims=True))
-        probs = exps / np.sum(exps, axis=1, keepdims=True)
+        probs = exps / np.sum(exps, axis=-1, keepdims=True)
 
         # compute negative log likelihood loss
-        log_probs = -np.log(probs[range(m), target_indices])
+        log_probs = -np.log(probs[range(m), target_indices] + 1e-10)
         loss_val = np.sum(log_probs) / m
 
         out = Tensor(loss_val, requires_grad=logits.requires_grad)
@@ -127,6 +150,7 @@ class Tensor:
                 grad = probs.copy()
                 grad[range(m), target_indices] -= 1
                 grad /= m
+                grad = grad * out.grad  # chain rule
                 logits.grad = (
                     logits.grad
                     if logits.grad is not None
@@ -148,7 +172,18 @@ class AdamOptimizer:
         self.v = [np.zeros_like(p.data) for p in self.params]
         self.t = 0
 
-    def step(self):
+    def step(self, max_grad_norm=None):
+        # gradient clipping
+        if max_grad_norm is not None:
+            total_norm = np.sqrt(
+                sum(np.sum(p.grad**2) for p in self.params if p.grad is not None)
+            )
+            clip_coef = max_grad_norm / (total_norm + 1e-6)
+            if clip_coef < 1:
+                for p in self.params:
+                    if p.grad is not None:
+                        p.grad = p.grad * clip_coef
+
         self.t += 1
         for i, p in enumerate(self.params):
             if p.grad is None:
@@ -162,3 +197,4 @@ class AdamOptimizer:
     def zero_grad(self):
         for p in self.params:
             p.grad = None
+
