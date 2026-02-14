@@ -1,5 +1,53 @@
 import numpy as np
+from numba import njit
 
+@njit
+def njit_matmul_forward(a, b):
+    return a @ b
+
+@njit
+def njit_relu_forward(a):
+    return np.maximum(0.0, a)
+
+@njit 
+def njit_add_forward(a, b):
+    return a + b
+
+@njit
+def njit_matmul_backward(a, b, grad_out):
+    grad_a = grad_out @ b.T
+    grad_b = a.T @ grad_out
+
+    return grad_a, grad_b
+
+@njit
+def njit_relu_backward(data, grad_out):
+    # create mask where data was > 0
+    mask = (data > 0).astype(np.float32)
+    return mask * grad_out
+
+@njit
+def njit_softmax_forward(x):
+    x_max = np.max(x, axis=1, keepdims=True)
+    exps = np.exp(x - x_max)
+    denom = np.sum(exps, axis=1, keepdims=True)
+    return exps / denom
+
+@njit
+def njit_softmax_backward(y, dy):
+    dot = np.sum(y * dy, axis=1, keepdims=True)
+    return y * (dy - dot)
+
+@njit
+def njit_adam_step(data, grad, m, v, beta1, beta2, lr, eps, t):
+    m[:] = beta1 * m + (1 - beta1) * grad
+    v[:] = beta2 * v + (1 - beta2) * (grad**2)
+
+    m_hat = m / (1 - beta1 ** t)
+    v_hat = v / (1 - beta2 ** t)
+
+    data -= lr * m_hat / (np.sqrt(v_hat) + eps)
+    return m, v
 
 class Tensor:
     def __init__(self, data, requires_grad=False):
@@ -36,7 +84,7 @@ class Tensor:
     def __add__(self, other):
         requires_grad = self.requires_grad or other.requires_grad
         other = other if isinstance(other, Tensor) else Tensor(other)
-        out = Tensor(self.data + other.data, requires_grad=requires_grad)
+        out = Tensor(njit_add_forward(self.data, other.data), requires_grad=requires_grad)
         out._prev = {self, other}
 
         def _backward():
@@ -80,53 +128,103 @@ class Tensor:
     def __matmul__(self, other):
         requires_grad = self.requires_grad or other.requires_grad
         other = other if isinstance(other, Tensor) else Tensor(other)
-        out = Tensor(np.matmul(self.data, other.data), requires_grad=requires_grad)
+
+        data = njit_matmul_forward(self.data, other.data)
+        out = Tensor(data, requires_grad=requires_grad)
         out._prev = {self, other}
 
         def _backward():
-            if self.requires_grad:
-                self.grad = (
-                    self.grad if self.grad is not None else np.zeros_like(self.data)
-                ) + np.matmul(out.grad, other.data.T)
+            ga, gb = njit_matmul_backward(self.data, other.data, out.grad)
 
+            if self.requires_grad:
+                self.grad = (self.grad if self.grad is not None else np.zeros_like(self.data)) + ga
             if other.requires_grad:
-                other.grad = (
-                    other.grad if other.grad is not None else np.zeros_like(other.data)
-                ) + np.matmul(self.data.T, out.grad)
+                other.grad = (other.grad if other.grad is not None else np.zeros_like(other.data)) + gb
 
         out._backward = _backward
         return out
-
+                    
     def relu(self):
-        requires_grad = self.requires_grad
-        out = Tensor(np.maximum(0, self.data), requires_grad=requires_grad)
+        out = Tensor(njit_relu_forward(self.data), requires_grad=self.requires_grad)
         out._prev = {self}
-
+        
         def _backward():
             if self.requires_grad:
-                mask = (self.data > 0).astype(np.float32)
-                self.grad = (
-                    self.grad if self.grad is not None else np.zeros_like(self.data)
-                ) + mask * out.grad
-
+                grad = njit_relu_backward(self.data, out.grad)
+                self.grad = (self.grad if self.grad is not None else 0) + grad
         out._backward = _backward
         return out
 
     def softmax(self):
-        exps = np.exp(self.data - np.max(self.data, axis=-1, keepdims=True))
-        probs = exps / np.sum(exps, axis=-1, keepdims=True)
+        probs = njit_softmax_forward(self.data)
         out = Tensor(probs, requires_grad=self.requires_grad)
         out._prev = {self}
 
         def _backward():
             if self.requires_grad:
+                #jit gradient calculation
+                grad = njit_softmax_backward(out.data, out.grad)
+                self.grad = (self.grad if self.grad is not None else 0) + grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        requires_grad = self.requires_grad or (
+            isinstance(other, Tensor) and other.requires_grad
+        )
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        out = Tensor(self.data * other.data, requires_grad=requires_grad)
+        out._prev = {self, other}
+
+        def _backward():
+            if self.requires_grad:
+                grad = out.grad * other.data
+                # handle broadcasting
+                if self.data.shape != grad.shape:
+                    ndims_added = grad.ndim - self.data.ndim
+                    for i in range(ndims_added):
+                        grad = grad.sum(axis=0)
+                    for i, (dim_orig, dim_grad) in enumerate(
+                        zip(self.data.shape, grad.shape)
+                    ):
+                        if dim_orig == 1 and dim_grad > 1:
+                            grad = grad.sum(axis=i, keepdims=True)
+
                 self.grad = (
                     self.grad if self.grad is not None else np.zeros_like(self.data)
-                )
-                s = (out.grad * out.data).sum(axis=-1, keepdims=True)
-                self.grad += out.data * (out.grad - s)
+                ) + grad
+
+            if other.requires_grad:
+                grad = out.grad * self.data
+                if other.data.shape != grad.shape:
+                    ndims_added = grad.ndim - other.data.ndim
+                    for i in range(ndims_added):
+                        grad = grad.sum(axis=0)
+                    for i, (dim_orig, dim_grad) in enumerate(
+                        zip(other.data.shape, grad.shape)
+                    ):
+                        if dim_orig == 1 and dim_grad > 1:
+                            grad = grad.sum(axis=i, keepdims=True)
+
+                other.grad = (
+                    other.grad if other.grad is not None else np.zeros_like(other.data)
+                ) + grad
 
         out._backward = _backward
+        return out
+
+    def sum(self):
+        out = Tensor(np.sum(self.data), requires_grad=self.requires_grad)
+        out._prev = {self}
+
+        def backward():
+            if self.requires_grad:
+                grad = np.ones_like(self.data) * out.grad
+                self.grad = (
+                    self.grad if self.grad is not None else np.zeros_like(self.data)
+                ) + grad
+
+        out._backward = backward
         return out
 
     @staticmethod
@@ -182,19 +280,50 @@ class AdamOptimizer:
             if clip_coef < 1:
                 for p in self.params:
                     if p.grad is not None:
-                        p.grad = p.grad * clip_coef
+                        p.grad *= clip_coef
 
         self.t += 1
+
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
-            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * p.grad
-            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (p.grad**2)
-            m_hat = self.m[i] / (1 - self.beta1**self.t)
-            v_hat = self.v[i] / (1 - self.beta2**self.t)
-            p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
-
+            
+            self.m[i], self.v[i] = njit_adam_step(
+                    p.data, p.grad, self.m[i], self.v[i], self.beta1, self.beta2, self.lr, self.eps, self.t
+                    )
     def zero_grad(self):
         for p in self.params:
             p.grad = None
+
+class Sequential:
+    def __init__(self, layers):
+        self.layers = layers
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+    def parameters(self):
+        params = []
+        for layer in self.layers:
+            if hasattr(layer, "parameters"):
+                params.extend(layer.parameters())
+        return params
+
+class ReLU:
+    def __call__(self, x):
+        return x.relu()
+
+class Linear:
+    def __init__(self, in_features, out_features):
+        limit = np.sqrt(2.0 / in_features)
+        self.weight = Tensor(
+                np.random.randn(in_features, out_features) * limit, requires_grad=True
+                )
+        self.bias = Tensor(np.zeros(out_features), requires_grad=True)  
+    def __call__(self, x):
+        return x @ self.weight + self.bias
+
+    def parameters(self):
+        return [self.weight, self.bias]
 
